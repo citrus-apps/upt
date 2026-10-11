@@ -267,7 +267,7 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 
 ## 11. Review history
 
-- **technical review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
+- **Initial technical review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
 - **Architecture review of `eb3bd3b`:** two High and two Medium findings, accepted after checking against the code:
   - (H1) P8 could not reconstruct an outcome from absent History → P8 rewritten as a fail-closed three-case contract with durable markers and an unresolved status (D9);
   - (H2) no durable protection when nothing commits → P11 pre-mutation marker with pending protection, enforced by existing cleanup/retention, sequenced as G2-S0 (P12);
