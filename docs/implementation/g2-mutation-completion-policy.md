@@ -4,7 +4,7 @@
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
 **Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
-**S0 foundation:** [schema-10 recovery-fence design](g2-s0-recovery-fence-design.md), recommended after re-review of `740555e`. This is a planning direction, not owner approval. The `protected_images` upsert, summary-only CLI journal and shared bootstrap-fence designs are withdrawn.
+**S0 foundation:** [schema-10 recovery-fence design](g2-s0-recovery-fence-design.md), recommended after technical re-review of `740555e`. This is a planning direction, not owner approval. The `protected_images` upsert, summary-only CLI journal and shared bootstrap-fence designs are withdrawn.
 
 ## Problem and required contract
 
@@ -267,15 +267,15 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 
 ## 11. Review history
 
-- **Review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
+- **technical review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
 - **Architecture review of `eb3bd3b`:** two High and two Medium findings, accepted after checking against the code:
   - (H1) P8 could not reconstruct an outcome from absent History → P8 rewritten as a fail-closed three-case contract with durable markers and an unresolved status (D9);
   - (H2) no durable protection when nothing commits → P11 pre-mutation marker with pending protection, enforced by existing cleanup/retention, sequenced as G2-S0 (P12);
   - (M3) retry after an ambiguous commit with a failed read could duplicate → P5 invariant and decision tree, `contradictory` outcome, tests 3–5;
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
 - **Review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
-- **Review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
-- **Re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates, while new G2 fences require precise in-flight own-operation revalidation; schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
+- **Technical review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
+- **Technical re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates, while new G2 fences require precise in-flight own-operation revalidation; schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
 
 ## 12. Design acceptance gate
 
