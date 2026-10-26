@@ -439,6 +439,22 @@ class StorageConstraintTests(Base):
         resolve(self.state, OP_2)
         self.assertEqual(self.state.completion_claims()["image"], frozenset())
 
+    def test_record_preserves_independent_shared_g2_claim_owners(self):
+        for owner, service in ((OP_1, self.service), (OP_2, compose_service(self.root, name="worker"))):
+            insert_fence(self.state, owner, service)
+            insert_claim(self.state, owner, "image", IMAGE_A)
+        tables = ("completion_fences", "completion_fence_claims")
+        before = table_rows(self.state.db_path, tables)
+        with self.state.write_transaction() as tx:
+            self.state.record(transaction=tx, stack="media", service="app", action="update",
+                              old_image_id=IMAGE_A, result="SUCCESS")
+        with self.state.connect() as c:
+            c.execute("UPDATE rollback_refs SET expired=1,purge_status='EXPIRED'")
+        self.assertEqual(table_rows(self.state.db_path, tables), before)
+        self.assertEqual(self.state.completion_claims()["image"], frozenset({IMAGE_A}))
+        self.assertEqual(retention._removal_blocker(self.state, IMAGE_A, check_active=True),
+                         "SKIPPED - UNRESOLVED RECOVERY CLAIM")
+
     def test_no_production_code_writes_g2_tables(self):
         source = Path(completion_fence.__file__).parent
         writer = re.compile(r"(INSERT(\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+completion_fence", re.I)

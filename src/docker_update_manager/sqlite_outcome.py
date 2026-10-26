@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 
 NOT_COMMITTED = "not_committed"
@@ -176,14 +177,18 @@ class OwnedTransaction:
     trace callback records every transaction-control statement the connection
     runs while the body owns it. The handle itself refuses such statements, so
     any observed one proves ownership was bypassed; ``_release`` reports it.
+    A private issuer token and the issuing thread bind the loan to its State
+    instance and transaction scope; record() checks these before History SQL.
     """
 
-    __slots__ = ("_connection", "_open", "_bypassed")
+    __slots__ = ("_connection", "_open", "_bypassed", "_owner", "_thread")
 
-    def __init__(self, connection):
+    def __init__(self, connection, *, _owner):
         self._connection = connection
         self._open = True
         self._bypassed = False
+        self._owner = _owner
+        self._thread = threading.get_ident()
         connection.set_trace_callback(self._observe)
 
     def _observe(self, statement):
@@ -191,12 +196,21 @@ class OwnedTransaction:
             self._bypassed = True
 
     def _checked(self, sql):
+        if threading.get_ident() != self._thread:
+            raise TransactionOwnershipError("transaction handle used outside its issuing thread")
         if not self._open:
             raise TransactionOwnershipError("transaction handle used after its transaction ended")
         if _leading_keyword(sql) in _TRANSACTION_CONTROL:
             raise TransactionOwnershipError("transaction control is owned by State.write_transaction")
+        if self._bypassed:
+            raise TransactionOwnershipError("the issuing SQLite transaction was replaced or ended")
         if not self._connection.in_transaction:
             raise TransactionOwnershipError("the owned SQLite transaction is no longer open")
+
+    def _assert_owner(self, owner):
+        if self._owner is not owner:
+            raise TransactionOwnershipError("transaction handle belongs to a different State instance")
+        self._checked("")
 
     def execute(self, sql, parameters=()):
         self._checked(sql)

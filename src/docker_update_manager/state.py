@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 import threading
 from .progress import BOOTSTRAP_STAGE_TOTAL, UPDATE_STAGE_TOTAL, RECONCILE_STAGE_TOTAL, UPDATE_RECORD_LABEL
-from .sqlite_outcome import AMBIGUOUS, NOT_COMMITTED, OwnedTransaction, WriteOutcomeError, sqlite_timeout
+from .sqlite_outcome import AMBIGUOUS, NOT_COMMITTED, OwnedTransaction, TransactionOwnershipError, WriteOutcomeError, sqlite_timeout
 from . import completion_fence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -183,6 +183,7 @@ class State:
         self._schema_lock = threading.Lock()
         self._schema_ready = False
         self._schema_version = None
+        self._transaction_owner = object()
         # Offline transition instances only: permits the existing schema-8 to 9
         # migration and validates schema 9. Schema 9 to 10 is performed solely
         # by state_transition.upgrade_schema10.
@@ -378,7 +379,7 @@ class State:
         try:
             try:
                 c.execute("BEGIN IMMEDIATE")
-                handle = OwnedTransaction(c)
+                handle = OwnedTransaction(c, _owner=self._transaction_owner)
             except Exception as exc:
                 raise WriteOutcomeError(NOT_COMMITTED, "begin", exc) from exc
             try:
@@ -623,36 +624,63 @@ class State:
                 else:
                     c.execute("UPDATE latest_scan SET finished_at=NULL,status='stale' WHERE singleton=1")
 
-    def record(self, *, namespace_operation_id=None, **kw):
+    def record(self, *, transaction=None, namespace_operation_id=None, **kw) -> int:
+        """Publish History and its rollback protection in one transaction.
+
+        A supplied handle must be a live write_transaction() loan from this
+        State and thread. Its returned History ID is provisional until the
+        caller's context commits; propagate errors out of that context so
+        the complete publication rolls back. Namespace publication retains
+        its dedicated, standalone transaction and event ordering.
+        """
+        if transaction is not None:
+            if namespace_operation_id is not None:
+                raise ValueError("namespace publication cannot borrow a transaction")
+            if type(transaction) is not OwnedTransaction:
+                raise TransactionOwnershipError("record requires a State.write_transaction handle")
+            transaction._assert_owner(self._transaction_owner)
         keys = list(kw)
         vals = [json.dumps(v) if isinstance(v, (dict, list)) else v for v in kw.values()]
+        if transaction is not None:
+            return self._record_in_transaction(transaction, kw, keys, vals)
         with self.connect() as c:
-            if namespace_operation_id:
-                row = c.execute("SELECT summary FROM operation_runs WHERE id=? AND kind='update' AND status='running'",
-                                (namespace_operation_id,)).fetchone()
-                if (not row or kw.get('result') != 'SUCCESS'
-                        or json.loads(row[0]).get('namespace_recreate_started') is not True):
-                    raise ValueError('namespace update publication is not authorised')
-            q = f"INSERT INTO history ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})"
-            cur = c.execute(q, vals)
-            if (kw.get("old_image_id") and kw.get("result") != "BLOCKED"
-                    and kw.get("action") not in {"compose_reconcile", "compose_bootstrap"}):
-                c.execute("INSERT OR REPLACE INTO protected_images(image_id,reason,history_id) VALUES(?,?,?)", (kw["old_image_id"], "rollback", cur.lastrowid))
-                c.execute("INSERT OR REPLACE INTO rollback_refs(history_id,image_id) VALUES(?,?)", (cur.lastrowid, kw["old_image_id"]))
-            if namespace_operation_id:
-                result = {'updated': True, 'history_id': cur.lastrowid, 'manual_recovery_required': False}
-                c.execute("UPDATE operation_runs SET status='succeeded',finished_at=?,current_stage='Complete',result=? WHERE id=?",
-                          (_utc_now(), json.dumps(result), namespace_operation_id))
-                c.execute("UPDATE compose_bootstrap_fences SET lifecycle='resolved',updated_at=? WHERE operation_id=?",
-                          (_utc_now(), namespace_operation_id))
-                # The History record is this update's durable completion point and its final
-                # stage; it is committed here, before the terminal event, because the core
-                # reporter can no longer persist events once the operation is terminal.
-                self._insert_operation_event(c, namespace_operation_id, 'task_completed', status='completed', message='Completed',
-                    stage=f'{UPDATE_STAGE_TOTAL}/{UPDATE_STAGE_TOTAL} {UPDATE_RECORD_LABEL}')
-                self._insert_operation_event(c, namespace_operation_id, 'operation_completed',
-                    stage='Complete', message='Namespace image update verified.', status='succeeded', payload=result)
-            return cur.lastrowid
+            return self._record_in_transaction(c, kw, keys, vals, namespace_operation_id=namespace_operation_id)
+
+    def _record_in_transaction(self, c, fields, keys, vals, *, namespace_operation_id=None):
+        """SQL only; transaction control belongs to the caller."""
+        if namespace_operation_id:
+            row = c.execute("SELECT summary FROM operation_runs WHERE id=? AND kind='update' AND status='running'",
+                            (namespace_operation_id,)).fetchone()
+            if (not row or fields.get('result') != 'SUCCESS'
+                    or json.loads(row[0]).get('namespace_recreate_started') is not True):
+                raise ValueError('namespace update publication is not authorised')
+        q = f"INSERT INTO history ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})"
+        cur = c.execute(q, vals)
+        if (fields.get("old_image_id") and fields.get("result") != "BLOCKED"
+                and fields.get("action") not in {"compose_reconcile", "compose_bootstrap"}):
+            c.execute("INSERT INTO rollback_refs(history_id,image_id) VALUES(?,?)", (cur.lastrowid, fields["old_image_id"]))
+            inserted = c.execute("INSERT INTO protected_images(image_id,reason,history_id) VALUES(?,'rollback',?) "
+                                 "ON CONFLICT(image_id) DO NOTHING", (fields["old_image_id"], cur.lastrowid)).rowcount == 1
+            protection = c.execute("SELECT r.image_id,p.image_id,p.history_id FROM rollback_refs r "
+                                   "LEFT JOIN protected_images p ON p.image_id=r.image_id WHERE r.history_id=?",
+                                   (cur.lastrowid,)).fetchone()
+            if (not protection or protection[0] != fields["old_image_id"] or protection[1] != fields["old_image_id"]
+                    or (inserted and protection[2] != cur.lastrowid)):
+                raise ValueError("History rollback protection does not match its record")
+        if namespace_operation_id:
+            result = {'updated': True, 'history_id': cur.lastrowid, 'manual_recovery_required': False}
+            c.execute("UPDATE operation_runs SET status='succeeded',finished_at=?,current_stage='Complete',result=? WHERE id=?",
+                      (_utc_now(), json.dumps(result), namespace_operation_id))
+            c.execute("UPDATE compose_bootstrap_fences SET lifecycle='resolved',updated_at=? WHERE operation_id=?",
+                      (_utc_now(), namespace_operation_id))
+            # The History record is this update's durable completion point and its final
+            # stage; it is committed here, before the terminal event, because the core
+            # reporter can no longer persist events once the operation is terminal.
+            self._insert_operation_event(c, namespace_operation_id, 'task_completed', status='completed', message='Completed',
+                stage=f'{UPDATE_STAGE_TOTAL}/{UPDATE_STAGE_TOTAL} {UPDATE_RECORD_LABEL}')
+            self._insert_operation_event(c, namespace_operation_id, 'operation_completed',
+                stage='Complete', message='Namespace image update verified.', status='succeeded', payload=result)
+        return cur.lastrowid
 
     def history(self, service=None):
         if not self.db_path.exists():

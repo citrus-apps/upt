@@ -296,6 +296,29 @@ class PostMarkerTests(Stage1bFixture):
         # The worker's own later completion cannot overwrite the verified result.
         self.assertFalse(self.state.finish_operation('web1', 'succeeded', message='done'))
 
+    def test_success_preserves_namespace_null_protection_and_adds_history_ref(self):
+        captured = []
+
+        def before_recreate():
+            with self.state.read() as c:
+                row = c.execute("SELECT * FROM protected_images WHERE image_id=?", (IMAGE_ID,)).fetchone()
+            captured.append(tuple(row))
+            self.assertIsNone(row['history_id'])
+
+        self.before_up = before_recreate
+        context = self.web_operation()
+        result = self.update(audit_context=context, namespace_review=self.plan().namespace_update_review)
+        with self.state.read() as c:
+            protection = c.execute("SELECT * FROM protected_images WHERE image_id=?", (IMAGE_ID,)).fetchone()
+            ref = c.execute("SELECT image_id FROM rollback_refs WHERE history_id=?", (result['history_id'],)).fetchone()
+            fence = c.execute("SELECT lifecycle FROM compose_bootstrap_fences WHERE operation_id='web1'").fetchone()
+            self.assertEqual(c.execute("SELECT count(*) FROM completion_fences").fetchone()[0], 0)
+        self.assertEqual(captured, [tuple(protection)])
+        self.assertEqual(protection['reason'], 'namespace update manual recovery')
+        self.assertEqual(tuple(ref), (IMAGE_ID,))
+        self.assertEqual(tuple(fence), ('resolved',))
+        self.assertEqual(self.operation()[0]['status'], 'succeeded')
+
     def test_web_owned_post_marker_failure_stays_failed(self):
         context = self.web_operation()
         self.on_up = lambda: self.replace_consumer(runtime_hash='9' * 64)
