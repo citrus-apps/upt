@@ -387,6 +387,7 @@ class RetentionWriterContentionTests(unittest.TestCase):
                                     old_image_id="sha256:aaa")
         with self.state.connect() as c:
             c.execute("UPDATE rollback_refs SET created='2026-01-01 00:00:00'")
+        protection_before = self._rows("SELECT * FROM protected_images WHERE image_id='sha256:initial'")
         published = []
 
         def docker(args, **_kwargs):
@@ -408,8 +409,8 @@ class RetentionWriterContentionTests(unittest.TestCase):
         self.assertIn({"image": "sha256:initial", "reason": "SKIPPED - SHARED ACTIVE ROLLBACK"},
                       result["skipped"])
         new_history, = published
-        self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images"),
-                         [("sha256:initial", new_history)])
+        # Publication adds a ref without taking ownership of the legacy row.
+        self.assertEqual(self._rows("SELECT * FROM protected_images"), protection_before)
         self.assertEqual(self._rows(f"SELECT expired FROM rollback_refs WHERE history_id={new_history}"),
                          [(0,)])
         self.assertEqual(self._rows(f"SELECT purge_status FROM rollback_refs WHERE history_id={earlier}"),
@@ -418,6 +419,7 @@ class RetentionWriterContentionTests(unittest.TestCase):
     def test_protection_published_during_docker_removal_is_not_deleted(self):
         when = datetime(2026, 1, 9, tzinfo=timezone.utc)
         self._expire_original_ref()
+        protection_before = self._rows("SELECT * FROM protected_images")
         published = []
 
         def docker(args, **_kwargs):
@@ -432,8 +434,7 @@ class RetentionWriterContentionTests(unittest.TestCase):
              patch("docker_update_manager.retention.run", side_effect=docker):
             cleanup(self.cfg, self.state, now=when)
         new_history, = published
-        self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images"),
-                         [("sha256:initial", new_history)])
+        self.assertEqual(self._rows("SELECT * FROM protected_images"), protection_before)
         self.assertEqual(self._rows("SELECT history_id,expired FROM rollback_refs ORDER BY history_id"),
                          [(self.original, 1), (new_history, 0)])
 
