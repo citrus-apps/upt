@@ -1,7 +1,7 @@
 """G2-S0b: schema-10 recovery fences/claims, offline migration and inert enforcement.
 
-Synthetic fences and claims are inserted with raw SQL by these tests only; no
-production code path writes the G2 tables. Docker, Compose and registry
+Synthetic fences and claims are inserted with raw SQL by these tests only; no live
+workflow invokes the dormant lifecycle primitives. Docker, Compose and registry
 boundaries are mocked; every database is an isolated temporary file.
 """
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
@@ -455,11 +455,11 @@ class StorageConstraintTests(Base):
         self.assertEqual(retention._removal_blocker(self.state, IMAGE_A, check_active=True),
                          "SKIPPED - UNRESOLVED RECOVERY CLAIM")
 
-    def test_no_production_code_writes_g2_tables(self):
+    def test_only_dormant_lifecycle_module_writes_g2_tables(self):
         source = Path(completion_fence.__file__).parent
         writer = re.compile(r"(INSERT(\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+completion_fence", re.I)
         offenders = [path.name for path in source.glob("*.py") if writer.search(path.read_text())]
-        self.assertEqual(offenders, [])
+        self.assertEqual(offenders, ["completion_lifecycle.py"])
 
 
 class AdmissionTests(Base):

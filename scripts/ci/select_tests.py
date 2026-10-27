@@ -107,6 +107,7 @@ RULES: tuple[tuple[str, Suite], ...] = (
     (SRC + "state.py", _full("persistent state and history")),
     (SRC + "state_transition.py", _full("persistent state transitions")),
     (SRC + "completion_fence.py", _full("G2 recovery fences and claims")),
+    (SRC + "completion_lifecycle.py", _full("G2 recovery fence lifecycle primitives")),
     (SRC + "sqlite_outcome.py", _full("persistent state transaction outcome primitives")),
     (SRC + "lock.py", _full("exclusive operation locking")),
     (SRC + "auth.py", _full("authentication")),

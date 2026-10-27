@@ -1,9 +1,8 @@
-"""G2 schema-10 recovery fences and claims: storage and inert, read-only guards.
+"""G2 schema-10 recovery fences and claims: strict readers and inert lifecycle storage.
 
 Policy: docs/implementation/g2-s0-recovery-fence-design.md (Option B, D3/D3b/
-D3c/D10). S0b deliberately contains no production writer: nothing in UPT
-creates, arms, enriches, releases or resolves a G2 fence. Admission and
-deletion paths only *read* these tables.
+D3c/D10). S0c-B1 adds dormant writers in completion_lifecycle.py. Admission and
+deletion paths only read these tables; no live workflow invokes the writers.
 
 Every reader validates strictly. A malformed, unknown or unreadable record
 raises CompletionFenceError (or the underlying sqlite3.Error); callers must
@@ -12,6 +11,7 @@ treat that as a refusal, never as an empty protection set.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -22,7 +22,7 @@ ACTIONS = ("update", "pinned_update", "rollback", "web_rollback")
 CLAIM_KINDS = ("image", "backup")
 # Backup claims name one direct child of a managed recovery root.
 BACKUP_CLAIM_ROOTS = ("backups", "conversion-file-backups", "conversion-snapshots", "restore-bundles")
-EVIDENCE_VERSION = 1
+EVIDENCE_VERSION = 2
 MAX_EVIDENCE_BYTES = 64 * 1024
 MAX_COMPOSE_FILES = 32
 MAX_PATH = 4096
@@ -106,6 +106,10 @@ class Fence:
     lifecycle: str
     working_dir: str
     compose_files: tuple
+    evidence: str
+    created_at: str
+    updated_at: str
+    claims: tuple = ()
 
 
 def create_schema(c):
@@ -143,23 +147,73 @@ def _absolute_path(value):
             and os.path.isabs(value) and os.path.abspath(value) == value)
 
 
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def evidence_digest(text):
+    _evidence(text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _evidence(text):
     if not isinstance(text, str) or len(text.encode("utf-8", "surrogatepass")) > MAX_EVIDENCE_BYTES:
         raise _invalid("evidence size")
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_json_object)
     except (ValueError, RecursionError):
         raise _invalid("evidence encoding") from None
-    if not isinstance(data, dict) or set(data) != {"version", "working_dir", "compose_files"}:
-        raise _invalid("evidence fields")
-    if type(data["version"]) is not int or data["version"] != EVIDENCE_VERSION:
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2):
         raise _invalid("evidence version")
+    fields = {"version", "working_dir", "compose_files"}
+    if data["version"] == 2:
+        fields |= {"revision", "claims", "facts", "receipt"}
+    if set(data) != fields:
+        raise _invalid("evidence fields")
     files = data["compose_files"]
     if (not _absolute_path(data["working_dir"]) or not isinstance(files, list)
             or not 0 < len(files) <= MAX_COMPOSE_FILES or not all(_absolute_path(item) for item in files)
             or len(set(files)) != len(files)):
         raise _invalid("evidence identity")
-    return data["working_dir"], tuple(files)
+    if data["version"] == 2:
+        if type(data["revision"]) is not int or not 1 <= data["revision"] <= 2147483647:
+            raise _invalid("evidence revision")
+        claims = data["claims"]
+        if (not isinstance(claims, list) or any(not isinstance(x, list) or len(x) != 2
+                or not valid_claim(*x) for x in claims)
+                or claims != [list(x) for x in sorted(set(map(tuple, claims)))]):
+            raise _invalid("evidence claims")
+        facts = data["facts"]
+        if not isinstance(facts, dict) or set(facts) - {"target_image_id", "running_image_id", "source_sha256", "backup_sha256"}:
+            raise _invalid("evidence facts")
+        for key, value in facts.items():
+            if key.endswith("image_id"):
+                if not valid_claim("image", value):
+                    raise _invalid("image fact")
+            else:
+                if not isinstance(value, dict) or not value:
+                    raise _invalid("digest facts")
+                for name, digest in value.items():
+                    valid_name = (_absolute_path(name) if key == "source_sha256"
+                                  else ["backup", name] in claims)
+                    if not valid_name or not isinstance(digest, str) or not _LOGICAL_KEY.fullmatch(digest):
+                        raise _invalid("digest fact")
+        receipt = data["receipt"]
+        if receipt is not None:
+            if (not isinstance(receipt, dict) or set(receipt) != {"proof", "completion_id", "history_id", "request_digest", "prior_evidence_digest"}
+                    or receipt["proof"] not in ("succeeded", "no_effect", "safe_recovery")
+                    or not isinstance(receipt["completion_id"], str) or not _OPERATION_ID.fullmatch(receipt["completion_id"])
+                    or type(receipt["history_id"]) is not int or receipt["history_id"] <= 0
+                    or data["revision"] < 2
+                    or any(not isinstance(receipt[k], str) or not _LOGICAL_KEY.fullmatch(receipt[k])
+                           for k in ("request_digest", "prior_evidence_digest"))):
+                raise _invalid("resolution receipt")
+    return data
 
 
 def _fence(row):
@@ -167,19 +221,26 @@ def _fence(row):
     operation_id, key, stack, compose_service, action, lifecycle, evidence, created, updated = tuple(row)
     if not (isinstance(operation_id, str) and _OPERATION_ID.fullmatch(operation_id)):
         raise _invalid("owner")
-    if lifecycle not in UNRESOLVED:
+    if lifecycle not in (*UNRESOLVED, "resolved"):
         raise _invalid("lifecycle")
     if action not in ACTIONS:
         raise _invalid("action")
     if not (isinstance(key, str) and _LOGICAL_KEY.fullmatch(key)) or not _name(stack) or not _name(compose_service):
         raise _invalid("logical service identity")
-    if not (isinstance(created, str) and created and isinstance(updated, str) and updated):
+    if not (isinstance(created, str) and 0 < len(created) <= 64 and "\x00" not in created
+            and isinstance(updated, str) and 0 < len(updated) <= 64 and "\x00" not in updated):
         raise _invalid("timestamps")
-    working_dir, files = _evidence(evidence)
+    data = _evidence(evidence)
+    working_dir, files = data["working_dir"], tuple(data["compose_files"])
+    if data["version"] == 2 and ((lifecycle == "resolved") != (data["receipt"] is not None)):
+        raise _invalid("receipt lifecycle")
+    if data["version"] == 2 and data["receipt"] is not None and data["receipt"]["completion_id"] != operation_id:
+        raise _invalid("receipt owner")
     # The stored key must be exactly reproducible from the stable identity.
     if logical_key(stack, compose_service, working_dir, files) != key:
         raise _invalid("logical service identity")
-    return Fence(operation_id, key, stack, compose_service, action, lifecycle, working_dir, files)
+    return Fence(operation_id, key, stack, compose_service, action, lifecycle, working_dir, files,
+                 evidence, created, updated)
 
 
 def unresolved_fences(c):
@@ -187,7 +248,7 @@ def unresolved_fences(c):
     rows = c.execute(
         "SELECT operation_id,logical_key,stack,compose_service,action,lifecycle,evidence,created_at,updated_at "
         "FROM completion_fences WHERE lifecycle IS NOT 'resolved' ORDER BY operation_id").fetchall()
-    fences = tuple(_fence(row) for row in rows)
+    fences = tuple(_with_claims(c, _fence(row)) for row in rows)
     if len({fence.logical_key for fence in fences}) != len(fences):
         raise _invalid("duplicate unresolved logical service")
     return fences
@@ -200,6 +261,37 @@ def valid_claim(kind, value):
         root, name = value.split("/")
         return root in BACKUP_CLAIM_ROOTS and bool(_BACKUP_NAME.fullmatch(name)) and ".." not in name
     return False
+
+
+_COLUMNS = "operation_id,logical_key,stack,compose_service,action,lifecycle,evidence,created_at,updated_at"
+
+
+def _with_claims(c, fence):
+    from dataclasses import replace
+    claims = tuple(tuple(row) for row in c.execute(
+        "SELECT kind,value FROM completion_fence_claims WHERE operation_id=? ORDER BY kind,value",
+        (fence.operation_id,)).fetchall())
+    if any(not valid_claim(*claim) for claim in claims) or len(set(claims)) != len(claims):
+        raise _invalid("claim")
+    data = _evidence(fence.evidence)
+    if data["version"] == 2 and claims != tuple(map(tuple, data["claims"])):
+        raise _invalid("claim evidence mismatch")
+    return replace(fence, claims=claims)
+
+
+def exact_fence(c, operation_id):
+    """Read one owner, including manual/resolved receipts, in the caller's snapshot.
+
+    None establishes absence only in this database snapshot. It is never a
+    retry or release authorisation. SQLite failures propagate unchanged.
+    """
+    if not isinstance(operation_id, str) or not _OPERATION_ID.fullmatch(operation_id):
+        raise _invalid("owner")
+    rows = c.execute("SELECT " + _COLUMNS + " FROM completion_fences WHERE operation_id=?",
+                     (operation_id,)).fetchall()
+    if len(rows) > 1:
+        raise _invalid("duplicate owner")
+    return _with_claims(c, _fence(rows[0])) if rows else None
 
 
 def unresolved_claims(c):
