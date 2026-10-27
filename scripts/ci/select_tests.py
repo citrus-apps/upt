@@ -62,7 +62,7 @@ COMPOSE_TESTS = (
     "test_schema_compatibility_boundary", "test_state_rollback_compatibility",
     "test_g2_completion_fences",
     "test_web_operations", "test_web_rollback", "test_core", "test_pin_history_image",
-    "test_sqlite_completion_characterisation",
+    "test_sqlite_completion_characterisation", "test_completion_lifecycle",
 )
 WEB_TESTS = (
     "test_web_closure_auth", "test_web_closure_http", "test_web_closure_scan",
@@ -107,6 +107,7 @@ RULES: tuple[tuple[str, Suite], ...] = (
     (SRC + "state.py", _full("persistent state and history")),
     (SRC + "state_transition.py", _full("persistent state transitions")),
     (SRC + "completion_fence.py", _full("G2 recovery fences and claims")),
+    (SRC + "completion_lifecycle.py", _full("G2 recovery fence lifecycle primitives")),
     (SRC + "sqlite_outcome.py", _full("persistent state transaction outcome primitives")),
     (SRC + "lock.py", _full("exclusive operation locking")),
     (SRC + "auth.py", _full("authentication")),

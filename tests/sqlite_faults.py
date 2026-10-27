@@ -10,6 +10,8 @@ production SQLite failure would surface, without replacing ``State`` methods:
   ``State`` write is being targeted.
 * ``after_commit`` - the matching statement executes, the transaction really
   commits, then the commit acknowledgement raises (an ambiguous commit).
+* ``commit_before_durability`` - the matched statement executes, then COMMIT
+  raises before durability; callers must still classify it as ambiguous.
 * ``unavailable`` - the matching statement raises and, from then on, every new
   connection fails until the context exits (persistent unavailability).
 * ``read_failure`` - the matching statement (normally a ``SELECT`` chosen with
@@ -84,7 +86,7 @@ class _Connection:
         if self._fault.remaining and self._fault.match(sql, row):
             self._fault.remaining -= 1
             self._fault.hits.append(row)
-            if self._fault.mode == "after_commit":
+            if self._fault.mode in {"after_commit", "commit_before_durability"}:
                 self._ambiguous = True
             else:
                 if self._fault.mode == "unavailable":
@@ -93,6 +95,9 @@ class _Connection:
         return self._real.execute(sql, params)
 
     def commit(self):
+        if self._ambiguous and self._fault.mode == "commit_before_durability":
+            self._ambiguous = False
+            raise sqlite3.OperationalError(self._fault.message)
         self._real.commit()
         if self._ambiguous:
             self._ambiguous = False
@@ -101,7 +106,7 @@ class _Connection:
 
 class SqliteFault:
     def __init__(self, match, mode, times, message):
-        if mode not in {"before_commit", "after_commit", "unavailable", "read_failure"}:
+        if mode not in {"before_commit", "after_commit", "commit_before_durability", "unavailable", "read_failure"}:
             raise ValueError(mode)
         self.match = match
         self.mode = mode
@@ -122,6 +127,7 @@ def sqlite_fault(state, match, *, mode="before_commit", times=1, message=None):
     fault = SqliteFault(match, mode, times, message or {
         "before_commit": "database is locked",
         "after_commit": "disk I/O error",
+        "commit_before_durability": "disk I/O error",
         "unavailable": "unable to open database file",
         "read_failure": "disk I/O error"}[mode])
     original = state._new_connection
